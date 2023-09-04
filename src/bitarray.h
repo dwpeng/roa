@@ -75,7 +75,7 @@ bitarraySet(BitArray* arr, size_t i, unsigned char value)
     return;
   }
   if (i >= arr->size) {
-    printf("index out of bounds. size: %zu, i: %zu\n", arr->size, i);
+    printf("[Set] index out of bounds. size: %zu, i: %zu\n", arr->size, i);
     return;
   }
   arr->data[(i * arr->nbit) / 8] &= ~(arr->mask << (i * arr->nbit) % 8);
@@ -90,8 +90,27 @@ bitarrayGet(BitArray* arr, size_t i)
     return 0;
   }
   if (i >= arr->size) {
-    printf("index out of bounds. size: %zu, i: %zu\n", arr->size, i);
+    printf("[Get] index out of bounds. size: %zu, i: %zu\n", arr->size, i);
     return 0;
   }
   return (arr->data[(i * arr->nbit) / 8] >> ((i * arr->nbit) % 8)) & arr->mask;
+}
+
+static inline void
+bitarrayOr(BitArray* arr, BitArray* other)
+{
+  if (arr == NULL || other == NULL) {
+    return;
+  }
+  if (arr->size != other->size) {
+    printf("[Or] size mismatch. arr->size: %zu, other->size: %zu\n", arr->size,
+           other->size);
+    return;
+  }
+#ifdef parallel
+#pragma omp parallel for
+#endif
+  for (size_t i = 0; i < arr->__realCols; i++) {
+    arr->data[i] |= other->data[i];
+  }
 }

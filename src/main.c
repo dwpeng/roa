@@ -1,10 +1,12 @@
 #include "alloc.h"
+#include "arg.h"
 #include "array.h"
 #include "bitarray.h"
 #include "file.h"
 #include "log.h"
 #include "seq.h"
 
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +48,7 @@ static inline void int2KmerString(uint64_t kmer, int k, char *buff) {
 #define KMER_MASK (1UL << 32) - 1
 #define KMER_LEN 16
 #define KMER_LONG_LEN 20
+#define KMER_LONG_MASK (1ULL << 40) - 1
 #define KMER_PER_CIRCLE 4
 
 static inline int
@@ -64,7 +67,8 @@ typedef struct {
   int pos : 30;
   int drop : 1;
   int strand : 1;
-  uint32_t kmer;
+  uint64_t kmer : 32;
+  uint64_t reverse_kmer : 32;
 } Kmer;
 
 typedef struct {
@@ -72,14 +76,16 @@ typedef struct {
   Array* seqs;  // Array<Seq*>
 } Query;
 
-typedef struct {
+typedef struct Segment Segment;
+struct Segment {
+  int id;          // id of the segment
   char* name;      // name of the segment
   size_t start;    // start position of the segment
   size_t end;      // end position of the segment
   BitArray* bases; // bases of the segment
   int vaild;       // if the segment is vaild
   float Tm;        // pcr melting temperature
-} Segment;
+};
 
 typedef struct {
   const char* path;
@@ -168,9 +174,10 @@ freeIndex(Index* index)
 #endif
 
 static inline Query*
-createQuery(const char* path)
+createQuery(const char* path, Index* index)
 {
   uint32_t kmer = 0x00000000;
+  uint32_t reverse_kmer = 0x00000000;
   unsigned char basemap[128] = { 4 };
   create_base2int(basemap);
   char c = 4;
@@ -183,7 +190,6 @@ createQuery(const char* path)
     {
       // create 16 mer
       int count = 0;
-
       // backup seq
       Seq* copy_seq = dmalloc(sizeof(Seq));
       copy_seq->name = dmalloc(sizeof(char) * (strlen(seq->name) + 1));
@@ -196,7 +202,6 @@ createQuery(const char* path)
       strcpy(copy_seq->seq, seq->seq);
       copy_seq->seq[seq->len] = '\0';
       arrayPush(query->seqs, copy_seq);
-
       Array* kmers = arrayNew(10);
       if (seq->len < KMER_LEN) {
         continue;
@@ -205,16 +210,20 @@ createQuery(const char* path)
         c = basemap[seq->seq[i]];
         if (c == 4) {
           kmer = 0x00000000;
+          reverse_kmer = 0x00000000;
           count = 0;
           continue;
         }
         kmer = (kmer << 2) | (c & 0x3) & KMER_MASK;
+        reverse_kmer =
+            (reverse_kmer >> 2) | ((0x00000003 - c) << 30) & KMER_MASK;
         count++;
         if (count < KMER_LEN) {
           continue;
         }
         Kmer* kmer_t = dmalloc(sizeof(Kmer));
         kmer_t->kmer = kmer;
+        kmer_t->reverse_kmer = reverse_kmer;
         kmer_t->pos = i - KMER_LEN + 1;
         kmer_t->drop = 0;
         kmer_t->strand = 0;
@@ -273,10 +282,11 @@ vaildKmers(Query* query, Index* index)
         kmer->drop = 1;
         continue;
       }
+      if (bitarrayGet(index->index, kmer->reverse_kmer)) {
+        kmer->drop = 1;
+        continue;
+      }
     }
-#ifdef parallel
-#pragma omp barrier
-#endif
     // set not continuous kmer to drop
     size_t window_start = 0;
     size_t window_end = 0;
@@ -385,12 +395,13 @@ static float GC_RATE[21] = {
 typedef struct {
   float minGC;
   float maxGC;
-  int minTm;
-  int maxTm;
+  float minTm;
+  float maxTm;
   int deComplementarity;
   int homeopolymer;
   int avoidCGIn3;
   int avoidTIn3;
+  int ncircle;
 } FilterOpts;
 
 static inline Array*
@@ -398,6 +409,9 @@ filterSegment(Array* segments, FilterOpts* opts)
 {
   Array* result = arrayNew(10);
   unsigned char bases[KMER_LONG_LEN] = { 4 };
+#ifdef parallel
+#pragma omp parallel for
+#endif
   for (size_t i = 0; i < segments->size; i++) {
     Segment* s = segments->data[i];
     debug("filter segment %zu", s->bases->size);
@@ -466,7 +480,6 @@ filterSegment(Array* segments, FilterOpts* opts)
       if (isHome) {
         continue;
       }
-
       Segment* segment = dmalloc(sizeof(Segment));
       segment->start = s->start + j;
       segment->end = s->start + j + KMER_LONG_LEN - 1;
@@ -477,65 +490,188 @@ filterSegment(Array* segments, FilterOpts* opts)
       for (size_t k = 0; k < KMER_LONG_LEN; k++) {
         bitarraySet(segment->bases, k, bases[k]);
       }
+#ifdef parallel
+#pragma omp critical
+#endif
+      // set id
+      segment->id = result->size;
       arrayPush(result, segment);
     }
   }
   return result;
 }
 
-static inline int
-cmpSegmentVaild(const void* a, const void* b)
+int
+cmpSegments(const void* a, const void* b)
 {
-  Segment* sa = (Segment*)a;
-  Segment* sb = (Segment*)b;
+  Segment* sa = *(Segment**)a;
+  Segment* sb = *(Segment**)b;
   return sb->vaild - sa->vaild;
 }
 
-static inline void
-rankSegmentByCount(Array* segments, Query* query)
+static inline Array*
+pairJoinCheck(Array* segments, Index* index)
 {
-  Array* seqs = query->seqs;
-  uint64_t longKmer = 0;
-  uint64_t longKmerMask = (1ULL << (KMER_LONG_LEN * 2)) - 1ULL;
-  unsigned char basemap[128] = { 4 };
-  create_base2int(basemap);
-  for (size_t i = 0; i < seqs->size; i++) {
-    Seq* seq = seqs->data[i];
-    for (size_t j = 0; j < seq->len - KMER_LONG_LEN + 1; j++) {
-      longKmer <<= 2;
-      longKmer &= longKmerMask;
-      longKmer |= (basemap[seq->seq[j]] & 0x3);
-      if (j < KMER_LONG_LEN) {
+  Array* pair = arrayNew(segments->size);
+  // connect every two segments and check if the connection is vaild
+  // if vaild, then join the two segments, insert the pair into the pair array
+  // connect
+#ifdef parallel
+#pragma omp parallel for
+#endif
+  for (size_t i = 0; i < segments->size; i++) {
+    Segment* s1 = segments->data[i];
+    arrayPush(pair, bitarrayNew(segments->size, 1));
+    for (size_t j = 0; j < segments->size; j++) {
+      if (i == j) {
         continue;
       }
-      // check if longKmer is in segment
-      for (size_t k = 0; k < segments->size; k++) {
-        Segment* s = segments->data[k];
-        uint64_t skmer = 0;
-        for (size_t z = 0; z < KMER_LONG_LEN; z++) {
-          skmer <<= 2;
-          skmer |= bitarrayGet(s->bases, z);
+      Segment* s2 = segments->data[j];
+      uint64_t kmer = 0ULL;
+      uint64_t reverseKmer = 0ULL;
+      int c = 0;
+      int succ = 1;
+      for (int k = 1; k < s1->bases->size + s2->bases->size - 1; k++) {
+        char base = 4;
+        if (k >= s1->bases->size) {
+          base = bitarrayGet(s2->bases, k - s1->bases->size);
+        } else {
+          base = bitarrayGet(s1->bases, k);
         }
-        if (skmer == longKmer) {
-          s->vaild++;
+        kmer = ((kmer << 2) | base) & KMER_MASK;
+        reverseKmer =
+            (reverseKmer >> 2) | ((3ULL - base) << ((KMER_LEN - 1) * 2));
+        c++;
+        if (c < KMER_LEN) {
+          continue;
         }
+        // query index
+        if (bitarrayGet(index->index, kmer)
+            || bitarrayGet(index->index, reverseKmer)) {
+          succ = 0;
+          break;
+        }
+      }
+      if (succ) {
+        s1->vaild++;
+        bitarraySet(arrayGet(pair, i), j, 1);
       }
     }
   }
-  for (size_t i = 0; i < segments->size; i++) {
-    Segment* s = segments->data[i];
-    s->vaild--;
+  // remove all segments that have circle deps
+  for (int i = 0; i < segments->size; i++) {
+    for (int j = 0; j < segments->size; j++) {
+      if (i == j) {
+        continue;
+      }
+      if (bitarrayGet(arrayGet(pair, i), j)
+          && bitarrayGet(arrayGet(pair, j), i)) {
+        bitarraySet(arrayGet(pair, j), i, 0);
+        ((Segment*)segments->data[i])->vaild--;
+      }
+    }
   }
-  // sort segments by vaild
-  qsort(segments->data, segments->size, sizeof(Segment*), cmpSegmentVaild);
+  qsort(segments->data, segments->size, sizeof(Segment**), cmpSegments);
+  return pair;
 }
 
-static inline Array*
-createCircle(Array* segment, int count)
+static inline void
+printPair(Array* pair, const char* path)
 {
-  size_t segmentSize = segment->size;
-  Array* result = arrayNew(count);
-  return NULL;
+  FILE* fp = fopen(path, "w");
+  if (fp == NULL) {
+    error("open file %s failed.", path);
+    exit(1);
+  }
+  for (size_t i = 0; i < pair->size; i++) {
+    for (size_t j = 0; j < pair->size; j++) {
+      fprintf(fp, "%d ", bitarrayGet(arrayGet(pair, i), j));
+    }
+    fprintf(fp, "\n");
+  }
+  fclose(fp);
+}
+
+static inline void
+freePairArray(Array* pair)
+{
+  for (size_t i = 0; i < pair->size; i++) {
+    bitarrayFree(pair->data[i]);
+  }
+  arrayFree(pair);
+}
+
+#define checkJoin(pair, s1, s2)                                               \
+  (pair == NULL ? 1 : bitarrayGet(arrayGet(pair, (s1)->id), (s2)->id))
+
+static inline Array*
+createCircle(Array* segments, Array* pair, int count)
+{
+  size_t segmentSize = segments->size;
+  Array* result = arrayNew(count * KMER_PER_CIRCLE);
+  int offset = 0;
+  Segment* prev = NULL;
+  Segment* next = NULL;
+  for (int i = 0; i < count; i++) {
+    // generate a random circle
+    for (int j = 0; j < KMER_PER_CIRCLE; j++) {
+      // find_circle;
+      arrayPush(result, segments->data[offset]);
+      offset++;
+    }
+  }
+  return result;
+}
+
+#define segmentToKmer(segment, kstr, rstr)                                    \
+  do {                                                                        \
+    uint64_t kmer = 0;                                                        \
+    uint64_t reverseKmer = 0;                                                 \
+    for (int i = 0; i < KMER_LONG_LEN; i++) {                                 \
+      kmer = (kmer << 2) | bitarrayGet(segment->bases, i);                    \
+      reverseKmer = (reverseKmer >> 2)                                        \
+                    | ((3ULL - bitarrayGet(segment->bases, i))                \
+                       << ((KMER_LONG_LEN - 1) * 2));                         \
+    }                                                                         \
+    int2KmerString(kmer, KMER_LONG_LEN, (kstr));                              \
+    int2KmerString(reverseKmer, KMER_LONG_LEN, (rstr));                       \
+  } while (0)
+
+static inline void
+saveCircle(Array* circle, int count, const char* outpath)
+{
+  FILE* fp = fopen(outpath, "w");
+  char circle_template[100] = { 0 };
+  char kmer_str[100] = { 0 };
+  char reverseKmer_str[100] = { 0 };
+  int circle_id = 1;
+  int circle_sub_id = 0;
+  int offset = 0;
+  int max_count = (circle->size + 3) / KMER_PER_CIRCLE;
+  if (count > max_count) {
+    info("count %d is larger than max count %d", count, max_count);
+    info("set count to %d", max_count);
+    count = max_count;
+  }
+  for (int i = 0; i < count * KMER_PER_CIRCLE; i++) {
+    Segment* s = (Segment*)circle->data[i];
+    segmentToKmer(s, kmer_str, reverseKmer_str);
+    fprintf(fp, ">probe-%d/%d %s:%ld\n%s\n", circle_id, circle_sub_id + 1,
+            s->name, s->start, reverseKmer_str);
+    circle_sub_id++;
+    for (int j = 0; j < KMER_LONG_LEN; j++) {
+      // copy from reverseKmer_str
+      circle_template[offset] = reverseKmer_str[j];
+      offset++;
+    }
+    if (circle_sub_id == KMER_PER_CIRCLE) {
+      fprintf(fp, ">circle-%d\n%s\n", circle_id, circle_template);
+      info("save circle %d/%d", circle_id, count);
+      circle_id++;
+      circle_sub_id = 0;
+      offset = 0;
+    }
+  }
 }
 
 static inline void
@@ -564,7 +700,7 @@ writeSegments(Array* segments, const char* output)
   uint64_t reverseKmer = 0;
   uint64_t kmerMask = (1ULL << (KMER_LONG_LEN * 2)) - 1;
   uint64_t kmerShift = (KMER_LONG_LEN - 1) * 2;
-  fprintf(fp, "id\tchr\tstart\tend\tTm\tkmer\treverse_kmer\n");
+  fprintf(fp, "id\tchr\tstart\tend\tTm\tkmer\treverse_kmer\tcount\n");
   for (size_t i = 0; i < segments->size; i++) {
     Segment* s = segments->data[i];
     for (int j = 0; j < KMER_LONG_LEN; j++) {
@@ -575,58 +711,229 @@ writeSegments(Array* segments, const char* output)
     }
     int2KmerString(kmer, KMER_LONG_LEN, buff1);
     int2KmerString(reverseKmer, KMER_LONG_LEN, buff2);
-    fprintf(fp, "%ld\t%s\t%ld\t%ld\t%.2f\t%s\t%s\n", i, s->name, s->start + 1,
-            s->end + 1, s->Tm, buff1, buff2);
+    fprintf(fp, "%d\t%s\t%ld\t%ld\t%.2f\t%s\t%s\t%d\n", s->id, s->name,
+            s->start + 1, s->end + 1, s->Tm, buff1, buff2, s->vaild);
   }
   fclose(fp);
 }
 
-int
-main(int argc, const char* argv[])
+#define p(...)                                                                \
+  do {                                                                        \
+    fprintf(stderr, __VA_ARGS__);                                             \
+  } while (0)
+
+void
+design_usage()
 {
-  if (argc != 4) {
-    fprintf(stderr, "Usage: %s <index> <query> <output>\n", argv[0]);
+  p("ROA Template Designer.\n");
+  p("Usage:\n");
+  p("  ./roa design <options>\n");
+  p("Options:\n");
+  p("  -i <index>    index file path\n");
+  p("  -q <query>    query file path\n");
+  p("  -o <output>   output file path[template.fa]\n");
+  p("  -homopolymer  homopolymer length[3]\n");
+  p("  -minGC        min GC rate[0.45]\n");
+  p("  -maxGC        max GC rate[0.55]\n");
+  p("  -minTm        min melting temperature[52.4]\n");
+  p("  -maxTm        max melting temperature[55.4]\n");
+  p("  -avoidCGIn3   avoid CG in 3' end[0]\n");
+  p("  -avoidTIn3    avoid T in 3' end[0]\n");
+  p("  -pairCheck    check pair[0] maybe cost a long time\n");
+  p("  -ncircle      number of circles\n");
+  p("  -h            show this help message\n");
+}
+
+void
+index_usage()
+{
+  p("ROA Template Designer.\n");
+  p("Usage:\n");
+  p("  ./roa index output.index ref1.fa ref2.fa ...\n");
+  p("Options:\n");
+  p("  -h            show this help message\n");
+}
+
+int
+usage(int argc, char* argv[])
+{
+  p("ROA Template Designer.\n");
+  p("Usage:\n");
+  p("  ./roa <command> <options>\n");
+  p("Commands:\n");
+  p("  index         create index file\n");
+  p("  design        design ROA template\n");
+  return 0;
+}
+
+int
+invoke_help(int argc, char* argv[])
+{
+  for (int i = 0; i < argc; i++) {
+    if (strcmp(argv[i], "-h") == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+arginit(do_design)
+{
+  if (invoke_help(argc, argv)) {
+    design_usage();
     exit(1);
   }
-  const char* index_path = argv[1];
-  const char* query_path = argv[2];
-  const char* output_path = argv[3];
-  log_set_level(PGLOG_LEVEL_DEBUG);
-  Index* index = NULL;
-  debug("start.");
-  char buff[1024] = { 0 };
-  sprintf(buff, "%s.index", index_path);
-  int exist = isFileExist(buff);
-  if (exist) {
-    index = loadIndex(buff);
-  } else {
-    index = createIndex(index, index_path);
-    dumpIndex(index, buff);
+  if (argc < 2) {
+    design_usage();
+    exit(1);
   }
-  debug("index created.");
-  Query* query = createQuery(query_path);
-  debug("query created.");
+  const char* index_path = NULL;
+  const char* query_path = NULL;
+  const char* output_path = "template.fa";
+  int homopolymer = 3;
+  float minGC = 0.45;
+  float maxGC = 0.55;
+  float minTm = 52.4;
+  float maxTm = 55.4;
+  int avoidCGIn3 = 0;
+  int avoidTIn3 = 0;
+  int ncircle = 20;
+  int pairCheck = 0;
+  argstart()
+  {
+    argpass("-h");
+    argstring("-i", index_path);
+    argstring("-q", query_path);
+    argstring("-o", output_path);
+    argint("-homopolymer", homopolymer);
+    argfloat("-minGC", minGC);
+    argfloat("-maxGC", maxGC);
+    argfloat("-minTm", minTm);
+    argfloat("-maxTm", maxTm);
+    argbool("-avoidCGIn3", avoidCGIn3);
+    argbool("-avoidTIn3", avoidTIn3);
+    argint("-ncircle", ncircle);
+    argbool("-pairCheck", pairCheck);
+    argend();
+  }
+  log_set_level(PGLOG_LEVEL_DEBUG);
+  if (index_path == NULL || query_path == NULL || output_path == NULL) {
+    design_usage();
+    exit(1);
+  }
+  info("index_path: %s", index_path);
+  info("query_path: %s", query_path);
+  info("output_path: %s", output_path);
+  info("homopolymer: %d", homopolymer);
+  info("minGC: %.2f", minGC);
+  info("maxGC: %.2f", maxGC);
+  info("minTm: %.2f", minTm);
+  info("maxTm: %.2f", maxTm);
+  info("avoidCGIn3: %d", avoidCGIn3);
+  info("avoidTIn3: %d", avoidTIn3);
+  info("ncircle: %d", ncircle);
+  info("pairCheck: %d", pairCheck);
+  Index* index = loadIndex(index_path);
+  Query* query = createQuery(query_path, index);
   vaildKmers(query, index);
-  debug("kmers vailded.");
   Array* segments = collectSegment(query);
-  debug("segments collected.");
-  FilterOpts filterOpts = {
-    .avoidCGIn3 = 1,
-    .avoidTIn3 = 1,
-    .minGC = 0.45,
-    .maxGC = 0.55,
-    .minTm = 50,
-    .maxTm = 60,
-    .deComplementarity = 1,
-    .homeopolymer = 4,
-  };
+  FilterOpts filterOpts = { .avoidCGIn3 = avoidCGIn3,
+                            .avoidTIn3 = avoidTIn3,
+                            .minGC = minGC,
+                            .maxGC = maxGC,
+                            .minTm = minTm,
+                            .maxTm = maxTm,
+                            .deComplementarity = 1,
+                            .homeopolymer = homopolymer,
+                            .ncircle = ncircle };
   Array* filtered = filterSegment(segments, &filterOpts);
-  rankSegmentByCount(filtered, query);
-  debug("segments filtered.");
-  writeSegments(filtered, output_path);
   freeSegments(segments);
+  debug("fileter %zu segments", filtered->size);
+  if (filtered->size) {
+    Array* pair = NULL;
+    if (pairCheck) {
+      pair = pairJoinCheck(filtered, index);
+    }
+    Array* circles = createCircle(filtered, pair, ncircle);
+
+    saveCircle(circles, ncircle, output_path);
+    if (pairCheck) {
+      freePairArray(pair);
+    }
+    arrayFree(circles);
+  }
+  else{
+    info("no specific kmer found.");
+  }
   freeSegments(filtered);
   freeQuery(query);
   freeIndex(index);
-  debug("memory usage: %lu", getUsedMemory());
+  debug("useMemory: %zu", getUsedMemory());
+}
+
+void
+do_index(int argc, char* argv[])
+{
+  if (invoke_help(argc, argv)) {
+    index_usage();
+    exit(1);
+  }
+  if (argc < 2) {
+    index_usage();
+    exit(1);
+  }
+  const char* index_path = argv[0];
+  Index* index = NULL;
+  for (int i = 1; i < argc; i++) {
+    const char* ref_path = argv[i];
+    if (!isFileExist(ref_path)) {
+      error("file %s not exist.", ref_path);
+      continue;
+    }
+    info("indexing %s", ref_path);
+    char buff[1024] = { 0 };
+    sprintf(buff, "%s.index", ref_path);
+    int exist = isFileExist(buff);
+    if (exist) {
+      if (index == NULL) {
+        index = loadIndex(buff);
+      } else {
+        Index* tmp = loadIndex(buff);
+        bitarrayOr(index->index, tmp->index);
+        freeIndex(tmp);
+      }
+    } else {
+      Index* tmp = createIndex(NULL, ref_path);
+      dumpIndex(tmp, buff);
+      if (index == NULL) {
+        index = tmp;
+      } else {
+        bitarrayOr(index->index, tmp->index);
+        freeIndex(tmp);
+      }
+    }
+  }
+  info("Saving to %s", index_path);
+  dumpIndex(index, index_path);
+  freeIndex(index);
+}
+
+int
+main(int argc, char* argv[])
+{
+  log_set_level(PGLOG_LEVEL_DEBUG);
+  if (argc < 2) {
+    usage(argc, argv);
+    return 0;
+  }
+  if (strcmp(argv[1], "index") == 0) {
+    do_index(argc - 2, argv + 2);
+    return 0;
+  }
+  if (strcmp(argv[1], "design") == 0) {
+    do_design(argc - 2, argv + 2);
+    return 0;
+  }
+  usage(argc, argv);
+  return 0;
 }
