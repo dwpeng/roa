@@ -1,6 +1,6 @@
 cc := gcc
 LIB = src/alloc.c src/log.c src/file.c
-CFLAGS = -lz -fopenmp -O3 -Dparallel -g
+CFLAGS = -lz -fopenmp -O3 -Dparallel
 TARGET = roa
 
 all: $(TARGET)
