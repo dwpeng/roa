@@ -860,6 +860,8 @@ index_usage()
   p("ROA Template Designer.\n");
   p("Usage:\n");
   p("  ./roa index output.index ref1.fa ref2.fa ...\n");
+  p("Example:\n");
+  p("  ./roa index index.index ref1.fa ref2.fa ...\n");
   p("Options:\n");
   p("  -h            show this help message\n");
 }
