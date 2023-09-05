@@ -30,7 +30,12 @@ static const char* __COLOR_LEVELS[] = { "\033[32mDEBUG\033[0m",
    : level == PGLOG_LEVEL_ERROR ? __COLOR_LEVELS[3]                           \
                                 : "UNKNOWN")
 
+#if defined (__linux__) 
 #define ISATTY(fp) isatty(fp->_fileno)
+#else
+#define ISAATTY(fp) 1
+#endif
+
 
 #define _STR(x) #x
 #define STR(x) _STR(x)
