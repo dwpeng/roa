@@ -95,3 +95,14 @@ arrayClear(Array* array)
       arrayPush((arr1), arrayGet((arr2), i));                                 \
     }                                                                         \
   } while (0)
+
+#define arrayPop(__array__)                                                   \
+  do {                                                                        \
+    if ((__array__)->size > 0) {                                              \
+      (__array__)->size--;                                                    \
+    }                                                                         \
+  } while (0)
+
+#define arrayLast(__array__)                                                  \
+  ((__array__)->size > 0 ? (__array__)->data[(__array__)->size - 1] : NULL)
+

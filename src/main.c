@@ -604,22 +604,129 @@ freePairArray(Array* pair)
 #define checkJoin(pair, s1, s2)                                               \
   (pair == NULL ? 1 : bitarrayGet(arrayGet(pair, (s1)->id), (s2)->id))
 
+typedef struct Node Node;
+struct Node {
+  Segment* segment;
+  int next_count;
+  Node** next;
+};
+
 static inline Array*
 createCircle(Array* segments, Array* pair, int count)
 {
   size_t segmentSize = segments->size;
   Array* result = arrayNew(count * KMER_PER_CIRCLE);
   int offset = 0;
-  Segment* prev = NULL;
-  Segment* next = NULL;
-  for (int i = 0; i < count; i++) {
-    // generate a random circle
-    for (int j = 0; j < KMER_PER_CIRCLE; j++) {
-      // find_circle;
-      arrayPush(result, segments->data[offset]);
-      offset++;
+  if (pair) {
+    Segment *a, *b;
+    int span = 1000;
+    Node** nodes = dmalloc(sizeof(Node*) * segmentSize);
+    for (size_t i = 0; i < segmentSize; i++) {
+      nodes[i] = dmalloc(sizeof(Node));
+      nodes[i]->segment = segments->data[i];
+      nodes[i]->next_count = 0;
+      nodes[i]->next = NULL;
+    }
+
+    for (int i = 0; i < segmentSize; i++) {
+      a = segments->data[i];
+      nodes[i]->next = dmalloc(sizeof(Node*) * segmentSize);
+      for (int j = 0; j < segmentSize; j++) {
+        if (i == j) {
+          continue;
+        }
+        b = segments->data[j];
+        if (checkJoin(pair, a, b)) {
+          if (b->start - a->start < span || a->start - b->start < span) {
+            continue;
+          }
+          nodes[i]->next[nodes[i]->next_count] = nodes[j];
+          nodes[i]->next_count++;
+        }
+      }
+    }
+
+    int circle_count = 0;
+    // dfs
+    Node** stack = dmalloc(sizeof(Node*) * segmentSize);
+    int stack_size = 0;
+    int* visited = dmalloc(sizeof(int) * segmentSize);
+    for (int i = 0; i < segmentSize; i++) {
+      visited[i] = 0;
+    }
+
+    for (int i = 0; i < segmentSize; i++) {
+      if (visited[i]) {
+        continue;
+      }
+      if (circle_count >= count) {
+        break;
+      }
+      stack[stack_size] = nodes[i];
+      stack_size++;
+      while (stack_size > 0) {
+        if (circle_count >= count) {
+          break;
+        }
+        Node* node = stack[stack_size - 1];
+        visited[node->segment->id] = 1;
+        if (node->next_count == 0) {
+          // find a circle
+          for (int i = 0; i < KMER_PER_CIRCLE; i++) {
+            arrayPush(result, node->segment);
+            visited[node->segment->id] = 1;
+          }
+          circle_count++;
+          stack_size = 0;
+          continue;
+        }
+        if (stack_size == KMER_PER_CIRCLE) {
+          // find a circle
+          for (int i = 0; i < KMER_PER_CIRCLE; i++) {
+            arrayPush(result, stack[i]->segment);
+            visited[stack[i]->segment->id] = 1;
+          }
+          circle_count++;
+          stack_size = 0;
+          continue;
+        }
+        int find = 0;
+        for (int i = 0; i < node->next_count; i++) {
+          if (visited[node->next[i]->segment->id]) {
+            continue;
+          }
+          stack[stack_size] = node->next[i];
+          stack_size++;
+          find = 1;
+          break;
+        }
+        if (find) {
+          continue;
+        }
+        stack_size--;
+      }
+    }
+
+    // free
+    for (int i = 0; i < segmentSize; i++) {
+      dfree(nodes[i]->next, sizeof(Node*) * segmentSize);
+      dfree(nodes[i], sizeof(Node));
+    }
+    dfree(nodes, sizeof(Node*) * segmentSize);
+    dfree(stack, sizeof(Node*) * segmentSize);
+    dfree(visited, sizeof(int) * segmentSize);
+
+  } else {
+    for (int i = 0; i < count; i++) {
+      // generate a random circle
+      for (int j = 0; j < KMER_PER_CIRCLE; j++) {
+        // find_circle;
+        arrayPush(result, segments->data[offset]);
+        offset++;
+      }
     }
   }
+
   return result;
 }
 
@@ -672,6 +779,7 @@ saveCircle(Array* circle, int count, const char* outpath)
       offset = 0;
     }
   }
+  fclose(fp);
 }
 
 static inline void
@@ -728,19 +836,21 @@ design_usage()
   p("ROA Template Designer.\n");
   p("Usage:\n");
   p("  ./roa design <options>\n");
+  p("Example:\n");
+  p("  ./roa design -i index.index -q query.fa -o template.fa -pairCheck 1\n");
   p("Options:\n");
   p("  -i <index>    index file path\n");
   p("  -q <query>    query file path\n");
-  p("  -o <output>   output file path[template.fa]\n");
-  p("  -homopolymer  homopolymer length[3]\n");
-  p("  -minGC        min GC rate[0.45]\n");
-  p("  -maxGC        max GC rate[0.55]\n");
-  p("  -minTm        min melting temperature[52.4]\n");
-  p("  -maxTm        max melting temperature[55.4]\n");
-  p("  -avoidCGIn3   avoid CG in 3' end[0]\n");
-  p("  -avoidTIn3    avoid T in 3' end[0]\n");
-  p("  -pairCheck    check pair[0] maybe cost a long time\n");
-  p("  -ncircle      number of circles\n");
+  p("  -o <output>   output file path [template.fa]\n");
+  p("  -homopolymer  homopolymer length [3]\n");
+  p("  -minGC        min GC rate [0.45]\n");
+  p("  -maxGC        max GC rate [0.55]\n");
+  p("  -minTm        min melting temperature [52.4]\n");
+  p("  -maxTm        max melting temperature [55.4]\n");
+  p("  -avoidCGIn3   avoid CG in 3' end [1]\n");
+  p("  -avoidTIn3    avoid T in 3' end [1]\n");
+  p("  -pairCheck    check pair [0] maybe cost a long time\n");
+  p("  -ncircle      number of circles [5]\n");
   p("  -h            show this help message\n");
 }
 
@@ -795,9 +905,9 @@ arginit(do_design)
   float maxGC = 0.55;
   float minTm = 52.4;
   float maxTm = 55.4;
-  int avoidCGIn3 = 0;
-  int avoidTIn3 = 0;
-  int ncircle = 20;
+  int avoidCGIn3 = 1;
+  int avoidTIn3 = 1;
+  int ncircle = 5;
   int pairCheck = 0;
   argstart()
   {
@@ -861,8 +971,7 @@ arginit(do_design)
       freePairArray(pair);
     }
     arrayFree(circles);
-  }
-  else{
+  } else {
     info("no specific kmer found.");
   }
   freeSegments(filtered);
