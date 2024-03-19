@@ -60,3 +60,6 @@ Options:
   -ncircle      number of circles [5]
   -h            show this help message
 ```
+
+## Cite
+> Hou, Z., Deng, W., Li, A. et al. A sensitive one-pot ROA assay for rapid miRNA detection. aBIOTECH (2024). https://doi.org/10.1007/s42994-024-00140-0
